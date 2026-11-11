@@ -5,6 +5,8 @@
   "author": {
     "name": "Makdia"
   },
+  "homepage": "https://github.com/makdia/claude-code-work-progress",
+  "repository": "https://github.com/makdia/claude-code-work-progress",
   "license": "MIT",
   "icon": "./.claude-plugin/icon.png",
   "types": "./types/index.d.ts"
