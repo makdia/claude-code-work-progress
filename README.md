@@ -5,9 +5,11 @@ A Claude Code side panel that shows what Claude is doing while it works, so you 
 ## What it shows
 
 - **Status** — working or idle, how long the task has run, and the step running now ("Editing src/app.php", "Running tests").
+- **Needs you** — the status turns red when Claude waits on a permission prompt or a question, so you notice from the corner of your eye.
 - **Progress** — Claude's to-do list with a done count, when it keeps one.
 - **Files changed** — every file Claude added (A), edited (M) or removed (D) this session, with lines added and removed.
-- **Recent steps** — the last steps of the current task, marked done, running or failed.
+- **Recent steps** — the last steps of the current task, marked done, running or failed, with how long each took.
+- **Summary toast** — when a task ends: "Done in 2m 10s · 4 files +52 -7 · 1 failed step" (only for tasks that changed files or ran 30 seconds or more).
 
 ```
 ● Working · 1m 20s
@@ -50,6 +52,11 @@ Start a new session. The panel opens by itself in a wide terminal; run `/progres
 - Only changes made through Claude's tools are tracked; your own edits and files changed by builds are not.
 - Removals are read from `rm`, `git rm` and `unlink` commands; wildcards and variables are skipped.
 - A sub-agent's file changes are counted; its steps are not listed.
+- After you approve a permission prompt, "Needs you" stays until that step finishes; Claude Code has no event for the moment you answer.
+
+## Development
+
+Run the tests with `claude plugin test .` and check the plugin with `claude plugin validate . --strict`.
 
 ## License
 

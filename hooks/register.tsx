@@ -7,13 +7,18 @@ const PANE = 'work-progress'
 const TITLE = 'Work progress'
 
 // Bump a shape tag when that value's fields change: old stored values are then dropped.
-const activity = atom({ plugin: 'work-progress', key: 'activity' } as const, { isWorking: false, task: '', startedAt: 0, lastMs: 0 } as Activity, { shape: 'activity-1' })
-const steps = atom({ plugin: 'work-progress', key: 'steps' } as const, [] as Step[], { shape: 'steps-1' })
+const IDLE: Activity = { isWorking: false, task: '', startedAt: 0, lastMs: 0, waitingFor: '', taskFiles: [], taskAdded: 0, taskRemoved: 0 }
+const activity = atom({ plugin: 'work-progress', key: 'activity' } as const, IDLE, { shape: 'activity-2' })
+const steps = atom({ plugin: 'work-progress', key: 'steps' } as const, [] as Step[], { shape: 'steps-2' })
 const changes = atom({ plugin: 'work-progress', key: 'changes' } as const, [] as FileChange[], { shape: 'changes-1' })
 const todos = atom({ plugin: 'work-progress', key: 'todos' } as const, [] as Todo[], { shape: 'todos-1' })
 
 const MAX_STEPS = 50
 const MAX_FILES = 300
+// A task shorter than this, with no file changed, gets no summary toast.
+const SUMMARY_MIN_MS = 30000
+// Tools that stop and wait for the person's answer.
+const ASKS_PERSON = new Set(['AskUserQuestion', 'ExitPlanMode'])
 
 let cwd = ''
 let ticker: Timer | undefined
@@ -77,6 +82,13 @@ const label = (tool: string, input: Record<string, unknown>): string => {
   }
 }
 
+const noteTask = (a: Activity, path: string, added: number, removed: number): Activity => ({
+  ...a,
+  taskFiles: a.taskFiles.includes(path) ? a.taskFiles : [...a.taskFiles, path].slice(-MAX_FILES),
+  taskAdded: a.taskAdded + added,
+  taskRemoved: a.taskRemoved + removed,
+})
+
 const record = (list: FileChange[], path: string, kind: ChangeKind, added: number, removed: number) => {
   const old = list.find(one => one.path === path)
   if (!old) return [...list, { path, kind, added, removed, edits: 1 }].slice(-MAX_FILES)
@@ -103,7 +115,11 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
     const now = await $.clock.now()
-    await update($, activity, a => ({ ...a, isWorking: true, task: e.text || a.task, startedAt: now }))
+    await update($, activity, a =>
+      e.text
+        ? { ...a, isWorking: true, task: e.text, startedAt: now, waitingFor: '', taskFiles: [], taskAdded: 0, taskRemoved: 0 }
+        : { ...a, isWorking: true, startedAt: now, waitingFor: '' },
+    )
     if (e.text) await update($, steps, () => [])
     ticker?.cancel()
     ticker = $.clock.every(5000, () => $.ui.invalidate('ui.render'))
@@ -115,20 +131,43 @@ export const register: Register = on => {
     ticker?.cancel()
     ticker = undefined
     const now = await $.clock.now()
-    await update($, activity, a => ({ ...a, isWorking: false, lastMs: now - a.startedAt }))
+    const done = await update($, activity, a => ({ ...a, isWorking: false, waitingFor: '', lastMs: now - a.startedAt }))
+    const failed = (await read($, steps)).filter(one => one.state === 'failed').length
+    const files = done.taskFiles.length
+    if (!e.isAborted && (files > 0 || done.lastMs >= SUMMARY_MIN_MS)) {
+      const parts = [`Done in ${seconds(done.lastMs)}`]
+      if (files > 0) parts.push(`${files} file${files === 1 ? '' : 's'} +${done.taskAdded} -${done.taskRemoved}`)
+      if (failed > 0) parts.push(`${failed} failed step${failed === 1 ? '' : 's'}`)
+      $.ui.toast(parts.join(' · '), { timeoutMs: 8000 })
+    }
+    return next(e)
+  })
+
+  // Raised just before Claude Code shows a permission prompt.
+  on('classic.PermissionRequest', async ($, e, next) => {
+    const what = label(e.tool_name, (e.tool_input ?? {}) as Record<string, unknown>)
+    await update($, activity, a => ({ ...a, waitingFor: `Approve: ${what}` }))
     return next(e)
   })
 
   on('tool.call', async ($, e, next) => {
     const input = e as unknown as Record<string, unknown>
-    const step: Step = { id: e.tool_use_id, label: label(e.tool, input), state: 'running' }
-    if (e.agentId === undefined) await update($, steps, list => [...list, step].slice(-MAX_STEPS))
+    const isMain = e.agentId === undefined
+    const startedAt = await $.clock.now()
+    const step: Step = { id: e.tool_use_id, label: label(e.tool, input), state: 'running', startedAt, ms: 0 }
+    if (isMain) await update($, steps, list => [...list, step].slice(-MAX_STEPS))
+    if (isMain && ASKS_PERSON.has(e.tool)) await update($, activity, a => ({ ...a, waitingFor: 'Answer the question in the chat' }))
 
     const ran = await next(e)
     const isOk = ran.deny === undefined && ran.isError !== true
+    const ms = (await $.clock.now()) - startedAt
 
-    if (e.agentId === undefined) {
-      await update($, steps, list => list.map(one => (one.id === step.id ? { ...one, state: isOk ? ('done' as const) : ('failed' as const) } : one)))
+    if (isMain) {
+      await update($, steps, list =>
+        list.map(one => (one.id === step.id ? { ...one, state: isOk ? ('done' as const) : ('failed' as const), ms } : one)),
+      )
+      // The call settled, so whatever it waited on was answered.
+      await update($, activity, a => (a.waitingFor ? { ...a, waitingFor: '' } : a))
     }
     if (!isOk) return ran
 
@@ -141,12 +180,17 @@ export const register: Register = on => {
       const path = short(e.file_path)
       const lines = isNew ? (out.content ?? '').split('\n').length : added
       await update($, changes, list => record(list, path, isNew ? 'added' : 'edited', lines, removed))
+      await update($, activity, a => noteTask(a, path, lines, removed))
     } else if (e.tool === 'NotebookEdit') {
       const path = short(e.notebook_path)
       await update($, changes, list => record(list, path, 'edited', 0, 0))
+      await update($, activity, a => noteTask(a, path, 0, 0))
     } else if (e.tool === 'Bash') {
       const gone = removedPaths(e.command)
-      if (gone.length) await update($, changes, list => gone.reduce((acc, p) => record(acc, short(p), 'removed', 0, 0), list))
+      if (gone.length) {
+        await update($, changes, list => gone.reduce((acc, p) => record(acc, short(p), 'removed', 0, 0), list))
+        await update($, activity, a => gone.reduce((acc, p) => noteTask(acc, short(p), 0, 0), a))
+      }
     }
     return ran
     // Only observes: a failure here must never block the tool call.
@@ -171,7 +215,9 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        {act.isWorking ? (
+        {act.waitingFor !== '' ? (
+          <Text color="red" bold>⚠ Needs you · {act.waitingFor}</Text>
+        ) : act.isWorking ? (
           <Text color="yellow" bold>● Working · {seconds(now - act.startedAt)}</Text>
         ) : (
           <Text color="green" bold>✓ Idle{act.lastMs ? ` · last task took ${seconds(act.lastMs)}` : ''}</Text>
@@ -212,6 +258,7 @@ export const register: Register = on => {
           {stepList.slice(-stepRoom).map(s => (
             <Text wrap="truncate-end" dimColor={s.state === 'done'} color={s.state === 'failed' ? 'red' : s.state === 'running' ? 'cyan' : undefined}>
               {s.state === 'running' ? '›' : s.state === 'failed' ? '✗' : '✓'} {s.label}
+              {s.state === 'running' ? ` · ${seconds(now - s.startedAt)}` : s.ms >= 1000 ? ` · ${seconds(s.ms)}` : ''}
             </Text>
           ))}
         </Box>
