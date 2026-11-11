@@ -9,6 +9,10 @@ A Claude Code side panel that shows what Claude is doing while it works, so you 
 - **Progress** — Claude's to-do list with a done count, when it keeps one.
 - **Files changed** — every file Claude added (A), edited (M) or removed (D) this session, with lines added and removed.
 - **Recent steps** — the last steps of the current task, marked done, running or failed, with how long each took.
+- **Decisions** — Claude doesn't stop to ask. It calls a `decide` tool this mod adds:
+  - *small* choices (naming, wording, styling): Claude picks its recommendation and keeps going;
+  - *costly* choices (architecture, data format, push, delete): Claude parks that part, does everything else, and waits.
+  Each decision shows in the panel with buttons and an "Other…" box. Change one and Claude is told at its next step, or in a new turn if it already finished; a small change gets revised, a parked one gets done.
 - **Summary toast** — when a task ends: "Done in 2m 10s · 4 files +52 -7 · 1 failed step" (only for tasks that changed files or ran 30 seconds or more).
 
 ```

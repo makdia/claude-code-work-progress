@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { Register, Timer } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Activity, ChangeKind, FileChange, Step, Todo } from '../types'
+import type { Activity, ChangeKind, Decision, DecisionCost, FileChange, Step, Todo } from '../types'
 
 const PANE = 'work-progress'
 const TITLE = 'Work progress'
@@ -12,6 +12,20 @@ const activity = atom({ plugin: 'work-progress', key: 'activity' } as const, IDL
 const steps = atom({ plugin: 'work-progress', key: 'steps' } as const, [] as Step[], { shape: 'steps-2' })
 const changes = atom({ plugin: 'work-progress', key: 'changes' } as const, [] as FileChange[], { shape: 'changes-1' })
 const todos = atom({ plugin: 'work-progress', key: 'todos' } as const, [] as Todo[], { shape: 'todos-1' })
+const decisions = atom({ plugin: 'work-progress', key: 'decisions' } as const, [] as Decision[], { shape: 'decisions-1' })
+// Answers from the person not yet read by Claude.
+const notes = atom({ plugin: 'work-progress', key: 'notes' } as const, [] as string[], { shape: 'notes-1' })
+
+const DECIDE = 'decide'
+const DECIDE_TOOL = /^mcp__work-progress__decide$/
+const MAX_DECISIONS = 50
+const DECIDE_HELP = [
+  'Record a decision instead of stopping to ask the person. They answer later in the Work progress panel while you keep working.',
+  "cost 'small': cheap to redo if changed (naming, wording, styling details, where a file goes). You decide: use `recommended` and continue at once.",
+  "cost 'costly': expensive to redo or hard to undo (architecture, data or storage format, an approach touching many files, push, delete, migration, sending anything). Do not guess: skip the work that depends on it, do all the work that does not, and if only parked work is left while it is unanswered, end your turn saying what waits on the person.",
+  "When unsure which cost applies, use 'costly'. Do not use this tool for what the person already decided.",
+  'Answers reach you as a note after a later tool result, or as a new message: for a small decision, revise the work that used the old choice; for a costly one, do the parked work.',
+].join('\n')
 
 const MAX_STEPS = 50
 const MAX_FILES = 300
@@ -89,6 +103,11 @@ const noteTask = (a: Activity, path: string, added: number, removed: number): Ac
   taskRemoved: a.taskRemoved + removed,
 })
 
+const describeChange = (d: Decision, choice: string) =>
+  d.cost === 'costly'
+    ? `Decision ${d.id} answered by the person: "${d.question}" → ${choice}. Do the work you parked for it now.`
+    : `Decision ${d.id} changed by the person: "${d.question}" → ${choice} (you had used ${d.chosen}). Revise the work that used ${d.chosen}.`
+
 const record = (list: FileChange[], path: string, kind: ChangeKind, added: number, removed: number) => {
   const old = list.find(one => one.path === path)
   if (!old) return [...list, { path, kind, added, removed, edits: 1 }].slice(-MAX_FILES)
@@ -99,10 +118,48 @@ const record = (list: FileChange[], path: string, kind: ChangeKind, added: numbe
   )
 }
 
+type Dollar = EngineInterface
+
+const deliver = async ($: Dollar, note: string) => {
+  const act = await read($, activity)
+  if (act.isWorking) {
+    await update($, notes, list => [...list, note])
+  } else {
+    void $.prompt.submit({ text: note })
+  }
+}
+
+// The person picks an option in the panel.
+const choose = async ($: Dollar, id: string, choice: string) => {
+  const list = await read($, decisions)
+  const d = list.find(one => one.id === id)
+  const picked = choice.trim()
+  if (!d || !picked) return
+  const isSame = d.by !== 'waiting' && d.chosen === picked
+  await update($, decisions, all => all.map(one => (one.id === id ? { ...one, chosen: picked, by: 'you' as const } : one)))
+  if (!isSame) await deliver($, describeChange(d, picked))
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     cwd = await $.session.cwd()
     await $.command.register({ name: 'progress', description: 'Open the work progress side panel' })
+    await $.tool.register({
+      name: DECIDE,
+      description: DECIDE_HELP,
+      isDeferred: false,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: 'The decision, as one short question' },
+          options: { type: 'array', items: { type: 'string' }, minItems: 2, maxItems: 6, description: 'The choices, short labels' },
+          recommended: { type: 'string', description: 'Your recommended option, one of options' },
+          why: { type: 'string', description: 'Why you recommend it, one short sentence' },
+          cost: { type: 'string', enum: ['small', 'costly'], description: 'How costly a wrong guess would be' },
+        },
+        required: ['question', 'options', 'recommended', 'why', 'cost'],
+      },
+    })
     void $.ui.open({ id: PANE, title: TITLE })
     return next(e)
   })
@@ -132,6 +189,12 @@ export const register: Register = on => {
     ticker = undefined
     const now = await $.clock.now()
     const done = await update($, activity, a => ({ ...a, isWorking: false, waitingFor: '', lastMs: now - a.startedAt }))
+    // Answers Claude never read this turn start a turn of their own.
+    const unread = await read($, notes)
+    if (unread.length > 0) {
+      await update($, notes, () => [])
+      void $.prompt.submit({ text: unread.join('\n') })
+    }
     const failed = (await read($, steps)).filter(one => one.state === 'failed').length
     const files = done.taskFiles.length
     if (!e.isAborted && (files > 0 || done.lastMs >= SUMMARY_MIN_MS)) {
@@ -141,6 +204,37 @@ export const register: Register = on => {
       $.ui.toast(parts.join(' · '), { timeoutMs: 8000 })
     }
     return next(e)
+  })
+
+  // Answers the decide tool; the generic tool.call hook below still records the step.
+  on('tool.call', { tool: DECIDE_TOOL }, async ($, e) => {
+    const input = e as unknown as Record<string, unknown>
+    const options = Array.isArray(input.options) ? input.options.filter((o): o is string => typeof o === 'string').slice(0, 6) : []
+    const question = typeof input.question === 'string' ? clip(input.question, 200) : ''
+    const recommended = typeof input.recommended === 'string' ? input.recommended : ''
+    const cost: DecisionCost = input.cost === 'small' ? 'small' : 'costly'
+    if (!question || options.length < 2 || !options.includes(recommended)) {
+      return { deny: 'decide needs a question, 2 to 6 options and a recommended value that is one of the options.' }
+    }
+    const list = await update($, decisions, all => {
+      const d: Decision = {
+        id: `D${all.length + 1}`,
+        question,
+        options,
+        recommended,
+        why: typeof input.why === 'string' ? clip(input.why, 200) : '',
+        cost,
+        chosen: cost === 'small' ? recommended : '',
+        by: cost === 'small' ? 'claude' : 'waiting',
+      }
+      return [...all, d].slice(-MAX_DECISIONS)
+    })
+    const d = list[list.length - 1] as Decision
+    const text =
+      cost === 'small'
+        ? `${d.id} recorded: using "${recommended}". Continue now; if the person changes it you will get a note.`
+        : `${d.id} parked: waiting for the person. Do not do the work that depends on it; continue everything else. If only parked work is left, end your turn and say what waits on them.`
+    return { result: text }
   })
 
   // Raised just before Claude Code shows a permission prompt.
@@ -169,7 +263,16 @@ export const register: Register = on => {
       // The call settled, so whatever it waited on was answered.
       await update($, activity, a => (a.waitingFor ? { ...a, waitingFor: '' } : a))
     }
-    if (!isOk) return ran
+    // The person's answers ride on the next result Claude reads.
+    let out = ran
+    if (isMain && ran.deny === undefined) {
+      const pending = await read($, notes)
+      if (pending.length > 0) {
+        await update($, notes, () => [])
+        out = { ...ran, context: [...(ran.context ?? []), ...pending] }
+      }
+    }
+    if (!isOk) return out
 
     if (e.tool === 'TodoWrite') {
       await update($, todos, () => e.todos.map(t => ({ content: t.content, status: t.status })))
@@ -192,15 +295,18 @@ export const register: Register = on => {
         await update($, activity, a => gone.reduce((acc, p) => noteTask(acc, short(p), 0, 0), a))
       }
     }
-    return ran
+    return out
     // Only observes: a failure here must never block the tool call.
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
-    const [act, stepList, fileList, todoList, now] = await Promise.all([
-      read($, activity), read($, steps), read($, changes), read($, todos), $.clock.now(),
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
+    const [act, stepList, fileList, todoList, decisionList, now] = await Promise.all([
+      read($, activity), read($, steps), read($, changes), read($, todos), read($, decisions), $.clock.now(),
     ])
+    const waiting = decisionList.filter(d => d.by === 'waiting')
+    // Open ones first, then the latest decided ones.
+    const shown = [...waiting, ...decisionList.filter(d => d.by !== 'waiting').slice(-4).reverse()]
     const width = Math.max(20, (e.viewport?.columns ?? 60) - 4)
     const rows = Math.max(10, e.viewport?.rows ?? 30)
 
@@ -219,6 +325,8 @@ export const register: Register = on => {
           <Text color="red" bold>⚠ Needs you · {act.waitingFor}</Text>
         ) : act.isWorking ? (
           <Text color="yellow" bold>● Working · {seconds(now - act.startedAt)}</Text>
+        ) : waiting.length > 0 ? (
+          <Text color="red" bold>⚠ Needs you · {waiting.length} decision{waiting.length === 1 ? '' : 's'} waiting</Text>
         ) : (
           <Text color="green" bold>✓ Idle{act.lastMs ? ` · last task took ${seconds(act.lastMs)}` : ''}</Text>
         )}
@@ -226,6 +334,37 @@ export const register: Register = on => {
         <Text wrap="truncate-end">
           Now: {act.isWorking ? (running ? running.label : 'Thinking…') : 'Waiting for you'}
         </Text>
+
+        {shown.length > 0 && (
+          <Box flexDirection="column" marginTop={1}>
+            <Text bold>Decisions{waiting.length > 0 ? ` · ${waiting.length} parked` : ''}</Text>
+            {shown.map(d => (
+              <Box flexDirection="column" key={d.id}>
+                <Text wrap="truncate-end" color={d.by === 'waiting' ? 'red' : undefined} dimColor={d.by === 'you'}>
+                  {d.by === 'waiting' ? '⏸' : '✓'} {d.id} {d.question}
+                  {d.by === 'waiting' ? ' · waiting for you' : ` · ${d.chosen} (${d.by === 'claude' ? 'decided by Claude' : 'yours'})`}
+                </Text>
+                {d.by !== 'you' && (
+                  <Box flexDirection="column">
+                    {d.why !== '' && <Text dimColor wrap="truncate-end">  Recommended: {d.recommended} · {d.why}</Text>}
+                    <Box flexDirection="row" flexWrap="wrap">
+                      {d.options.map(option => (
+                        <Button
+                          key={`${d.id}-${option}`}
+                          variant={option === d.chosen || (d.by === 'waiting' && option === d.recommended) ? 'primary' : undefined}
+                          onPress={() => void choose($, d.id, option)}
+                        >
+                          {option}
+                        </Button>
+                      ))}
+                    </Box>
+                    <Input key={`${d.id}-other`} placeholder="Other… (type and press Enter)" onSubmit={value => void choose($, d.id, value)} />
+                  </Box>
+                )}
+              </Box>
+            ))}
+          </Box>
+        )}
 
         {todoList.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
