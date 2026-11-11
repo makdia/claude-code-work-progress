@@ -208,6 +208,11 @@ const estimator = (on: Parameters<TestBody>[1], reply: string | null, saved: unk
 
 test('a typed task gets a size, a cost per model and a suggested model', async ($, on) => {
   const commands: string[] = []
+  const copied: string[] = []
+  on('ui.copy', (_, e) => {
+    copied.push(e.text)
+    return { value: { isCopied: true } }
+  })
   engine(on, { now: 1000 }, [])
   estimator(on, SIZED, [], commands)
   await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
@@ -219,7 +224,8 @@ test('a typed task gets a size, a cost per model and a suggested model', async (
   expect((await ui.find({ type: 'Text', text: /Suggested/ }))?.text).toBe('Suggested: opus · multi-file change')
   await ui.press({ key: 'switch-model' })
   await ui.unmount()
-  expect(commands).toEqual(['/model opus'])
+  // A mod cannot switch the model itself: the button copies the command.
+  expect(copied).toEqual(['/model opus'])
 })
 
 test('the actual cost is shown and remembered for later estimates', async ($, on) => {

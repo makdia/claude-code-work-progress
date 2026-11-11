@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface, Timer } from 'claude-code'
 
 import type { Activity, ChangeKind, Decision, DecisionCost, Estimate, FileChange, ModelTier, Step, TaskSize, Todo } from '../types'
 
@@ -220,10 +220,11 @@ const learn = async ($: Dollar, size: TaskSize, used: Usage) => {
   await $.store.set(CALIBRATION_KEY, calibration)
 }
 
-const switchModel = async ($: Dollar, tier: ModelTier) => {
-  const ran = await $.command.run({ command: 'model', args: tier }).catch(() => undefined)
-  if (!ran) $.ui.toast(`Could not switch. Type /model ${tier}`)
-  else await update($, estimate, e => (e ? { ...e, current: tier } : e))
+// A mod cannot change the session's model, so copy the command for the person to paste.
+const copyModelCommand = async ($: Dollar, tier: ModelTier, surface: RenderSurface) => {
+  const command = `/model ${tier}`
+  const copied = await $.ui.copy({ text: command, surface }).catch(() => ({ isCopied: false as const, reason: 'no-surface' as const }))
+  $.ui.toast(copied.isCopied ? `Copied ${command}. Paste it at the prompt and press Enter.` : `Type ${command} at the prompt.`)
 }
 
 // The person picks an option in the panel.
@@ -492,10 +493,10 @@ export const register: Register = on => {
                 </Text>
                 {est.current !== '' && est.current !== est.suggested && (
                   <Box flexDirection="row">
-                    <Button key="switch-model" variant="primary" onPress={() => void switchModel($, est.suggested)}>
-                      Switch to {est.suggested}
+                    <Button key="switch-model" variant="primary" onPress={press => void copyModelCommand($, est.suggested, press.surface)}>
+                      Copy /model {est.suggested}
                     </Button>
-                    <Text dimColor> now: {est.current} · a switch restarts the prompt cache</Text>
+                    <Text dimColor> now: {est.current} · paste it at the prompt; a switch restarts the prompt cache</Text>
                   </Box>
                 )}
               </Box>
