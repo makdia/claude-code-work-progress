@@ -1,0 +1,13 @@
+{
+  "name": "claude-code-work-progress",
+  "owner": {
+    "name": "Makdia"
+  },
+  "description": "Work progress side panel for Claude Code: live steps and every file added, edited or removed",
+  "plugins": [
+    {
+      "name": "work-progress",
+      "source": "./"
+    }
+  ]
+}

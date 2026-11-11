@@ -1,0 +1,56 @@
+# Work progress
+
+A Claude Code side panel that shows what Claude is doing while it works, so you can follow along at a glance without reading the whole transcript.
+
+## What it shows
+
+- **Status** — working or idle, how long the task has run, and the step running now ("Editing src/app.php", "Running tests").
+- **Progress** — Claude's to-do list with a done count, when it keeps one.
+- **Files changed** — every file Claude added (A), edited (M) or removed (D) this session, with lines added and removed.
+- **Recent steps** — the last steps of the current task, marked done, running or failed.
+
+```
+● Working · 1m 20s
+Now: Editing resources/style/cards.scss
+
+Files changed (3) +42 -7
+A src/new-file.php   +30 -0
+M cards.scss         +12 -7
+D old-helper.js
+```
+
+## Install
+
+At the prompt of a Claude Code terminal session:
+
+```
+/plugin install work-progress --marketplace makdia/claude-code-work-progress
+```
+
+Answer `y` to add the marketplace, then pick a scope (user scope loads it in every project).
+
+From a shell:
+
+```
+claude plugin install work-progress --marketplace makdia/claude-code-work-progress
+```
+
+In the desktop app, where `/plugin` does not run: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `makdia/claude-code-work-progress`, then **Add plugin**.
+
+Or clone the repository to `~/.claude/mods/work-progress` and load the folder in every session by adding this to `~/.claude/settings.json`:
+
+```json
+"env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/.claude/mods/work-progress" }
+```
+
+Start a new session. The panel opens by itself in a wide terminal; run `/progress` to open it any time.
+
+## Limits
+
+- Only changes made through Claude's tools are tracked; your own edits and files changed by builds are not.
+- Removals are read from `rm`, `git rm` and `unlink` commands; wildcards and variables are skipped.
+- A sub-agent's file changes are counted; its steps are not listed.
+
+## License
+
+MIT

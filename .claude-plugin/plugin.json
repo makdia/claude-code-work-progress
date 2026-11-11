@@ -1,0 +1,11 @@
+{
+  "name": "work-progress",
+  "version": "0.1.0",
+  "description": "Side panel: what Claude is doing now, its to-do progress, and every file added, edited or removed with +/- lines",
+  "author": {
+    "name": "Makdia"
+  },
+  "license": "MIT",
+  "icon": "./.claude-plugin/icon.png",
+  "types": "./types/index.d.ts"
+}
