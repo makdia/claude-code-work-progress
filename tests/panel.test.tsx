@@ -1,6 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 
+// The test runner has timers; the mod's own typings leave them out.
+declare const setTimeout: (run: () => void, ms: number) => unknown
+
 const PANE = {
   plugin: 'work-progress',
   component: 'Pane',
@@ -180,4 +183,75 @@ test('a decide call with a recommendation outside its options is refused', async
   await start($, 'x')
   const ran = await decide($, { question: 'Q?', options: ['a', 'b'], recommended: 'c', why: '', cost: 'small' })
   expect(ran.deny).toContain('recommended value that is one of the options')
+})
+
+const SIZED = '{"size":"medium","kind":"feature","model":"opus","why":"multi-file change"}'
+// reply null: the model call is refused.
+const estimator = (on: Parameters<TestBody>[1], reply: string | null, saved: unknown[], commands: string[]) => {
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('clock.after', () => ({ value: undefined }))
+  on('model.complete', () => reply === null ? { deny: 'blocked' } : ({ value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', (_, e) => {
+    saved.push(e)
+    return { value: undefined }
+  })
+  on('command.run', (_, e) => {
+    commands.push(`/${e.command} ${e.args}`)
+    return { text: 'ok' }
+  })
+}
+
+test('a typed task gets a size, a cost per model and a suggested model', async ($, on) => {
+  const commands: string[] = []
+  engine(on, { now: 1000 }, [])
+  estimator(on, SIZED, [], commands)
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'add a wishlist button to every product card', origin: { kind: 'composer' }, wait: false })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /^Estimate ·/ }))?.text).toBe('Estimate · medium feature')
+  expect((await ui.find({ type: 'Text', text: /haiku ~/ }))?.text).toBe('haiku ~$0.03 · sonnet ~$0.53 · opus ~$1.06 · fable ~$1.82')
+  expect((await ui.find({ type: 'Text', text: /Suggested/ }))?.text).toBe('Suggested: opus · multi-file change')
+  await ui.press({ key: 'switch-model' })
+  await ui.unmount()
+  expect(commands).toEqual(['/model opus'])
+})
+
+test('the actual cost is shown and remembered for later estimates', async ($, on) => {
+  const saved: unknown[] = []
+  engine(on, { now: 1000 }, [])
+  estimator(on, SIZED, saved, [])
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'add a wishlist button', origin: { kind: 'composer' }, wait: false })
+  await $.turn.start({ text: 'add a wishlist button', turnId: 'e' })
+  const usage = { model: 'claude-sonnet-5-5', input_tokens: 10000, output_tokens: 10000, cache_creation_input_tokens: 40000, cache_read_input_tokens: 1000000 }
+  await $.turn.complete({ answer: 'done', durationMs: 60000, isAborted: false, turnId: 'e', reason: 'answer', usage })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // 10k*2 + 10k*10 + 40k*2.5 + 1M*0.1 = $0.32
+  expect((await ui.find({ type: 'Text', text: /Spent so far/ }))?.text).toBe('Spent so far: $0.32 (estimate ~$0.53 on sonnet)')
+  await ui.unmount()
+  expect(JSON.stringify(saved)).toContain('"medium":{"input_tokens":10000')
+})
+
+test('a reply that is not the expected JSON shows no estimate', async ($, on) => {
+  engine(on, { now: 1000 }, [])
+  estimator(on, 'not json', [], [])
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'fix the typo', origin: { kind: 'composer' }, wait: false })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Estimate/ }))?.text).toBe('Estimate: not available for this task.')
+  await ui.unmount()
+})
+
+test('a failed model call shows no estimate instead of waiting forever', async ($, on) => {
+  engine(on, { now: 1000 }, [])
+  estimator(on, null, [], [])
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'fix the typo', origin: { kind: 'composer' }, wait: false })
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Estimate/ }))?.text).toBe('Estimate: not available for this task.')
+  await ui.unmount()
 })

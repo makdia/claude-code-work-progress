@@ -15,6 +15,23 @@ export type Decision = {
   by: 'claude' | 'you' | 'waiting'
 }
 
+export type TaskSize = 'tiny' | 'small' | 'medium' | 'large'
+export type ModelTier = 'haiku' | 'sonnet' | 'opus' | 'fable'
+export type Estimate = {
+  task: string
+  state: 'thinking' | 'ready' | 'failed'
+  size: TaskSize
+  kind: string
+  suggested: ModelTier
+  why: string
+  // The session's model when the task started, as a tier ('' if unknown).
+  current: ModelTier | ''
+  // Estimated dollars per tier at API prices.
+  costs: Record<ModelTier, number>
+  // Dollars actually spent on this task so far (main loop turns).
+  actual: number
+}
+
 export type Activity = {
   isWorking: boolean
   task: string
@@ -37,6 +54,7 @@ declare module 'claude-code' {
       todos: Shaped<Todo[]>
       decisions: Shaped<Decision[]>
       notes: Shaped<string[]>
+      estimate: Shaped<Estimate | null>
     }
   }
 }

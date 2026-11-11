@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Activity, ChangeKind, Decision, DecisionCost, FileChange, Step, Todo } from '../types'
+import type { Activity, ChangeKind, Decision, DecisionCost, Estimate, FileChange, ModelTier, Step, TaskSize, Todo } from '../types'
 
 const PANE = 'work-progress'
 const TITLE = 'Work progress'
@@ -15,6 +15,57 @@ const todos = atom({ plugin: 'work-progress', key: 'todos' } as const, [] as Tod
 const decisions = atom({ plugin: 'work-progress', key: 'decisions' } as const, [] as Decision[], { shape: 'decisions-1' })
 // Answers from the person not yet read by Claude.
 const notes = atom({ plugin: 'work-progress', key: 'notes' } as const, [] as string[], { shape: 'notes-1' })
+
+const estimate = atom({ plugin: 'work-progress', key: 'estimate' } as const, null as Estimate | null, { shape: 'estimate-1' })
+
+// API prices in dollars per million tokens (Claude API reference, 2026-11-03).
+// Cache write is 1.25x input; Haiku's cache read is assumed at 0.1x input.
+type Usage = { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number }
+const PRICES: Record<ModelTier, { input: number; output: number; cacheWrite: number; cacheRead: number }> = {
+  haiku: { input: 0.1, output: 0.5, cacheWrite: 0.125, cacheRead: 0.01 },
+  sonnet: { input: 2, output: 10, cacheWrite: 2.5, cacheRead: 0.1 },
+  opus: { input: 4, output: 20, cacheWrite: 5, cacheRead: 0.2 },
+  fable: { input: 8, output: 40, cacheWrite: 10, cacheRead: 0.2 },
+}
+const TIERS: ModelTier[] = ['haiku', 'sonnet', 'opus', 'fable']
+// Starting guesses of one task's tokens per size; real tasks replace them over time.
+const PRIOR: Record<TaskSize, Usage> = {
+  tiny: { input_tokens: 2000, output_tokens: 1000, cache_creation_input_tokens: 10000, cache_read_input_tokens: 40000 },
+  small: { input_tokens: 5000, output_tokens: 4000, cache_creation_input_tokens: 30000, cache_read_input_tokens: 250000 },
+  medium: { input_tokens: 15000, output_tokens: 15000, cache_creation_input_tokens: 80000, cache_read_input_tokens: 1500000 },
+  large: { input_tokens: 40000, output_tokens: 50000, cache_creation_input_tokens: 250000, cache_read_input_tokens: 6000000 },
+}
+const SIZES = Object.keys(PRIOR) as TaskSize[]
+const CALIBRATION_KEY = 'calibration-v1'
+type Calibration = Partial<Record<TaskSize, Usage & { count: number }>>
+
+const tierOf = (model: string): ModelTier | '' => TIERS.find(t => model.toLowerCase().includes(t)) ?? ''
+const costOf = (u: Usage, tier: ModelTier) => {
+  const p = PRICES[tier]
+  return (u.input_tokens * p.input + u.output_tokens * p.output + u.cache_creation_input_tokens * p.cacheWrite + u.cache_read_input_tokens * p.cacheRead) / 1e6
+}
+const dollars = (n: number) => (n < 0.01 ? '<$0.01' : `$${n.toFixed(2)}`)
+
+const ESTIMATE_SYSTEM = [
+  'You size tasks for a coding agent. Reply with JSON only, no prose:',
+  '{"size":"tiny|small|medium|large","kind":"question|small fix|feature|refactor|debugging|research|other","model":"haiku|sonnet|opus|fable","why":"under 12 words"}',
+  'size: tiny = a question or one-line change; small = one file or one clear fix; medium = a few files or a feature; large = many files, unclear bugs, or long research.',
+  'model: the cheapest that will do it well. haiku: questions, lookups, trivial edits. sonnet: routine coding and clear fixes. opus: multi-file features, unclear bugs, design choices. fable: only very hard, long work.',
+].join('\n')
+
+const parseEstimate = (text: string) => {
+  const match = text.match(/\{[\s\S]*\}/)
+  if (!match) return undefined
+  try {
+    const raw = JSON.parse(match[0]) as Record<string, unknown>
+    const size = SIZES.find(one => one === raw.size)
+    const model = TIERS.find(one => one === raw.model)
+    if (!size || !model) return undefined
+    return { size, suggested: model, kind: typeof raw.kind === 'string' ? clip(raw.kind, 30) : 'other', why: typeof raw.why === 'string' ? clip(raw.why, 90) : '' }
+  } catch {
+    return undefined
+  }
+}
 
 const DECIDE = 'decide'
 const DECIDE_TOOL = /^mcp__work-progress__decide$/
@@ -129,6 +180,48 @@ const deliver = async ($: Dollar, note: string) => {
   }
 }
 
+const readCalibration = async ($: Dollar): Promise<Calibration> => {
+  const raw = await $.store.get(CALIBRATION_KEY).catch(() => undefined)
+  return raw && typeof raw === 'object' ? (raw as Calibration) : {}
+}
+
+// Expected tokens for a size: the prior counts as one task, real tasks add to the mean.
+const expected = (calibration: Calibration, size: TaskSize): Usage => {
+  const seen = calibration[size]
+  const prior = PRIOR[size]
+  if (!seen || seen.count < 1) return prior
+  const mix = (key: keyof Usage) => (prior[key] + seen[key] * seen.count) / (seen.count + 1)
+  return { input_tokens: mix('input_tokens'), output_tokens: mix('output_tokens'), cache_creation_input_tokens: mix('cache_creation_input_tokens'), cache_read_input_tokens: mix('cache_read_input_tokens') }
+}
+
+const runEstimate = async ($: Dollar, task: string) => {
+  const reply = await $.model.complete({ model: 'haiku', system: ESTIMATE_SYSTEM, prompt: clip(task, 2000), maxTokens: 200, timeoutMs: 20000 })
+  const parsed = reply.isAnswered ? parseEstimate(reply.text) : undefined
+  const current = tierOf(await $.session.model().catch(() => ''))
+  if (!parsed) {
+    await update($, estimate, e => (e && e.task === task ? { ...e, state: 'failed' as const, current } : e))
+    return
+  }
+  const usage = expected(await readCalibration($), parsed.size)
+  const costs = { haiku: costOf(usage, 'haiku'), sonnet: costOf(usage, 'sonnet'), opus: costOf(usage, 'opus'), fable: costOf(usage, 'fable') }
+  await update($, estimate, e => (e && e.task === task ? { ...e, ...parsed, state: 'ready' as const, current, costs } : e))
+}
+
+const learn = async ($: Dollar, size: TaskSize, used: Usage) => {
+  const calibration = await readCalibration($)
+  const seen = calibration[size] ?? { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, count: 0 }
+  const n = seen.count + 1
+  const avg = (key: keyof Usage) => seen[key] + (used[key] - seen[key]) / n
+  calibration[size] = { input_tokens: avg('input_tokens'), output_tokens: avg('output_tokens'), cache_creation_input_tokens: avg('cache_creation_input_tokens'), cache_read_input_tokens: avg('cache_read_input_tokens'), count: n }
+  await $.store.set(CALIBRATION_KEY, calibration)
+}
+
+const switchModel = async ($: Dollar, tier: ModelTier) => {
+  const ran = await $.command.run({ command: 'model', args: tier }).catch(() => undefined)
+  if (!ran) $.ui.toast(`Could not switch. Type /model ${tier}`)
+  else await update($, estimate, e => (e ? { ...e, current: tier } : e))
+}
+
 // The person picks an option in the panel.
 const choose = async ($: Dollar, id: string, choice: string) => {
   const list = await read($, decisions)
@@ -141,6 +234,23 @@ const choose = async ($: Dollar, id: string, choice: string) => {
 }
 
 export const register: Register = on => {
+  // A typed task gets a quick size and cost estimate from the smallest model.
+  on('prompt.submit', async ($, e, next) => {
+    const ran = await next(e)
+    const isTyped = e.command === undefined && e.origin?.kind !== 'plugin' && !e.isMeta
+    if (isTyped && e.text.trim().length > 0) {
+      const empty = { haiku: 0, sonnet: 0, opus: 0, fable: 0 }
+      await update($, estimate, () => ({ task: e.text, state: 'thinking' as const, size: 'small' as const, kind: '', suggested: 'sonnet' as const, why: '', current: '' as const, costs: empty, actual: 0 }))
+      // Off the prompt's path: the task starts while the estimate runs.
+      $.clock.after(0, () => {
+        void runEstimate($, e.text).catch(() =>
+          update($, estimate, x => (x && x.task === e.text ? { ...x, state: 'failed' as const } : x)),
+        )
+      })
+    }
+    return ran
+  })
+
   on('session.start', async ($, e, next) => {
     cwd = await $.session.cwd()
     await $.command.register({ name: 'progress', description: 'Open the work progress side panel' })
@@ -189,6 +299,13 @@ export const register: Register = on => {
     ticker = undefined
     const now = await $.clock.now()
     const done = await update($, activity, a => ({ ...a, isWorking: false, waitingFor: '', lastMs: now - a.startedAt }))
+    const used = e.usage
+    const tier = used ? tierOf(used.model) : ''
+    if (used && tier) {
+      const spent = costOf(used, tier)
+      const est = await update($, estimate, x => (x ? { ...x, actual: x.actual + spent } : x))
+      if (est && est.state === 'ready' && !e.isAborted) await learn($, est.size, used)
+    }
     // Answers Claude never read this turn start a turn of their own.
     const unread = await read($, notes)
     if (unread.length > 0) {
@@ -301,8 +418,8 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
-    const [act, stepList, fileList, todoList, decisionList, now] = await Promise.all([
-      read($, activity), read($, steps), read($, changes), read($, todos), read($, decisions), $.clock.now(),
+    const [act, stepList, fileList, todoList, decisionList, est, now] = await Promise.all([
+      read($, activity), read($, steps), read($, changes), read($, todos), read($, decisions), read($, estimate), $.clock.now(),
     ])
     const waiting = decisionList.filter(d => d.by === 'waiting')
     // Open ones first, then the latest decided ones.
@@ -334,6 +451,40 @@ export const register: Register = on => {
         <Text wrap="truncate-end">
           Now: {act.isWorking ? (running ? running.label : 'Thinking…') : 'Waiting for you'}
         </Text>
+
+        {est && (
+          <Box flexDirection="column" marginTop={1}>
+            {est.state === 'thinking' && <Text dimColor>Estimate: sizing the task…</Text>}
+            {est.state === 'failed' && <Text dimColor>Estimate: not available for this task.</Text>}
+            {est.state === 'ready' && (
+              <Box flexDirection="column">
+                <Text bold>Estimate · {est.size} {est.kind}</Text>
+                <Text wrap="truncate-end">
+                  {TIERS.map(t => `${t} ~${dollars(est.costs[t])}`).join(' · ')}
+                </Text>
+                <Text wrap="truncate-end" color={est.current !== '' && est.current !== est.suggested ? 'cyan' : 'green'}>
+                  {est.current === est.suggested ? `✓ ${est.current} fits this task` : `Suggested: ${est.suggested}`}
+                  {est.why ? ` · ${est.why}` : ''}
+                </Text>
+                {est.current !== '' && est.current !== est.suggested && (
+                  <Box flexDirection="row">
+                    <Button key="switch-model" variant="primary" onPress={() => void switchModel($, est.suggested)}>
+                      Switch to {est.suggested}
+                    </Button>
+                    <Text dimColor> now: {est.current} · a switch restarts the prompt cache</Text>
+                  </Box>
+                )}
+              </Box>
+            )}
+            {est.actual > 0 && (
+              <Text wrap="truncate-end">
+                Spent so far: {dollars(est.actual)}
+                {est.state === 'ready' && est.current !== '' ? ` (estimate ~${dollars(est.costs[est.current])} on ${est.current})` : ''}
+              </Text>
+            )}
+            <Text dimColor>At API prices; on a plan this is usage, not a bill.</Text>
+          </Box>
+        )}
 
         {shown.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
