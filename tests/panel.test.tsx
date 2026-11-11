@@ -24,6 +24,7 @@ const engine = (on: Parameters<TestBody>[1], clock: { now: number }, toasts: str
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.now', () => ({ value: clock.now }))
   on('clock.every', () => ({ value: undefined }))
+  on('clock.after', () => ({ value: undefined }))
   on('turn.start', () => ({ turnId: 't' }))
   on('classic.PermissionRequest', () => ({}))
   on('turn.complete', (_, e) => ({ text: e.answer }))
@@ -144,6 +145,10 @@ test('a costly decision is parked, and an answer while idle starts a new turn', 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /Needs you/ }))?.text).toBe('⚠ Needs you · 1 decision waiting')
   expect((await ui.find({ type: 'Text', text: /D1 Store/ }))?.text).toBe('⏸ D1 Store it in DB or theme.json? · waiting for you')
+  // Input-needed items use Claude Code's permission color, not red.
+  const ask = await ui.find({ type: 'Text', text: /Your input/ })
+  expect(ask?.text?.trim()).toBe('Your input: /decide D1 <option>')
+  expect(JSON.stringify(ask)).toContain('"color":"permission"')
   await ui.input({ key: 'D1-other', text: 'wp_options' })
   await ui.unmount()
 
@@ -189,7 +194,6 @@ const SIZED = '{"size":"medium","kind":"feature","model":"opus","why":"multi-fil
 // reply null: the model call is refused.
 const estimator = (on: Parameters<TestBody>[1], reply: string | null, saved: unknown[], commands: string[]) => {
   on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
-  on('clock.after', () => ({ value: undefined }))
   on('model.complete', () => reply === null ? { deny: 'blocked' } : ({ value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }))
   on('store.get', () => ({ value: undefined }))
   on('store.set', (_, e) => {
@@ -254,4 +258,29 @@ test('a failed model call shows no estimate instead of waiting forever', async (
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /Estimate/ }))?.text).toBe('Estimate: not available for this task.')
   await ui.unmount()
+})
+
+test('/decide answers a decision from the prompt, and lists open ones', async ($, on) => {
+  const prompts: string[] = []
+  engine(on, { now: 1000 }, [], prompts)
+  await start($, 'style it')
+  await decide($, { question: 'Hover shadow?', options: ['soft', 'strong'], recommended: 'soft', why: 'Subtle', cost: 'small' })
+  await $.turn.complete({ answer: 'done', durationMs: 5000, isAborted: false, turnId: 'd', reason: 'answer' })
+
+  // As typed at the prompt; the engine fills origin and presentation.
+  type RunInput = Parameters<Parameters<TestBody>[0]['command']['run']>[0]
+  const run = (args: string) => $.command.run({ command: 'decide', args } as unknown as RunInput)
+  const listed = await run('')
+  expect(listed.text).toBe('Answer with /decide <id> <option>:\nD1 Hover shadow? [soft | strong] now: soft')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /^Answer:/ }))?.text).toBe('Answer: /decide D1 <option> · or ctrl+x tab, then Tab and Enter')
+  await ui.unmount()
+
+  const answered = await run('d1 STRONG')
+  expect(answered.text).toBe('D1 → strong.')
+  // The new turn starts from a timer, just after the command.
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+  expect(prompts).toEqual(['Decision D1 changed by the person: "Hover shadow?" → strong (you had used soft). Revise the work that used soft.'])
+  expect((await run('D9 x')).text).toBe('No decision D9.')
 })

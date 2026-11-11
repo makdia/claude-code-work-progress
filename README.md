@@ -13,7 +13,7 @@ A Claude Code side panel that shows what Claude is doing while it works, so you 
 - **Decisions** — Claude doesn't stop to ask. It calls a `decide` tool this mod adds:
   - *small* choices (naming, wording, styling): Claude picks its recommendation and keeps going;
   - *costly* choices (architecture, data format, push, delete): Claude parks that part, does everything else, and waits.
-  Each decision shows in the panel with buttons and an "Other…" box. Change one and Claude is told at its next step, or in a new turn if it already finished; a small change gets revised, a parked one gets done.
+  Each decision shows in the panel with buttons and an "Other…" box. Answer from the prompt with `/decide D2 theme.json` (or your own words), or press ctrl+x then tab to move into the panel and use Tab and Enter on the buttons. `/decide` alone lists the open decisions. Change one and Claude is told at its next step, or in a new turn if it already finished; a small change gets revised, a parked one gets done.
 - **Summary toast** — when a task ends: "Done in 2m 10s · 4 files +52 -7 · 1 failed step" (only for tasks that changed files or ran 30 seconds or more).
 
 ```

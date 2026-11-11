@@ -67,6 +67,9 @@ const parseEstimate = (text: string) => {
   }
 }
 
+// Claude Code's own color for asking the person; red stays for failures.
+const NEEDS_YOU = 'permission'
+
 const DECIDE = 'decide'
 const DECIDE_TOOL = /^mcp__work-progress__decide$/
 const MAX_DECISIONS = 50
@@ -176,7 +179,8 @@ const deliver = async ($: Dollar, note: string) => {
   if (act.isWorking) {
     await update($, notes, list => [...list, note])
   } else {
-    void $.prompt.submit({ text: note })
+    // From a later dispatch: a command.run hook may not wait on a new turn.
+    $.clock.after(0, () => void $.prompt.submit({ text: note }).catch(() => $.ui.toast('Could not send the answer to Claude')))
   }
 }
 
@@ -254,6 +258,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     cwd = await $.session.cwd()
     await $.command.register({ name: 'progress', description: 'Open the work progress side panel' })
+    await $.command.register({ name: 'decide', description: 'Answer a decision from the Work progress panel: /decide D2 theme.json', argumentHint: '<id> <option or your own answer>' })
     await $.tool.register({
       name: DECIDE,
       description: DECIDE_HELP,
@@ -272,6 +277,25 @@ export const register: Register = on => {
     })
     void $.ui.open({ id: PANE, title: TITLE })
     return next(e)
+  })
+
+  // Answers a decision from the prompt, where the panel's buttons need focus first.
+  on('command.run', { command: 'decide' }, async ($, e) => {
+    const list = await read($, decisions)
+    const match = (e.args ?? '').trim().match(/^(D\d+)\s+(.+)$/i)
+    if (!match) {
+      const open = list.filter(d => d.by !== 'you').slice(-6)
+      const lines = open.map(d => `${d.id} ${d.question} [${d.options.join(' | ')}] now: ${d.by === 'waiting' ? 'waiting' : d.chosen}`)
+      return { text: open.length ? `Answer with /decide <id> <option>:\n${lines.join('\n')}` : 'No open decisions.' }
+    }
+    const id = (match[1] as string).toUpperCase()
+    const answer = (match[2] as string).trim()
+    const d = list.find(one => one.id === id)
+    if (!d) return { text: `No decision ${id}.` }
+    // A typed option matches its button regardless of case.
+    const option = d.options.find(o => o.toLowerCase() === answer.toLowerCase()) ?? answer
+    await choose($, id, option)
+    return { text: `${id} → ${option}.` }
   })
 
   on('command.run', { command: 'progress' }, async $ => {
@@ -439,11 +463,11 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         {act.waitingFor !== '' ? (
-          <Text color="red" bold>⚠ Needs you · {act.waitingFor}</Text>
+          <Text color={NEEDS_YOU} bold>⚠ Needs you · {act.waitingFor}</Text>
         ) : act.isWorking ? (
           <Text color="yellow" bold>● Working · {seconds(now - act.startedAt)}</Text>
         ) : waiting.length > 0 ? (
-          <Text color="red" bold>⚠ Needs you · {waiting.length} decision{waiting.length === 1 ? '' : 's'} waiting</Text>
+          <Text color={NEEDS_YOU} bold>⚠ Needs you · {waiting.length} decision{waiting.length === 1 ? '' : 's'} waiting</Text>
         ) : (
           <Text color="green" bold>✓ Idle{act.lastMs ? ` · last task took ${seconds(act.lastMs)}` : ''}</Text>
         )}
@@ -489,15 +513,21 @@ export const register: Register = on => {
         {shown.length > 0 && (
           <Box flexDirection="column" marginTop={1}>
             <Text bold>Decisions{waiting.length > 0 ? ` · ${waiting.length} parked` : ''}</Text>
+            <Text dimColor wrap="truncate-end">Answer: /decide {shown[0]?.id ?? 'D1'} &lt;option&gt; · or ctrl+x tab, then Tab and Enter</Text>
             {shown.map(d => (
-              <Box flexDirection="column" key={d.id}>
-                <Text wrap="truncate-end" color={d.by === 'waiting' ? 'red' : undefined} dimColor={d.by === 'you'}>
+              <Box
+                flexDirection="column"
+                key={d.id}
+                {...(d.by === 'waiting' ? { borderStyle: 'round', borderColor: NEEDS_YOU, paddingX: 1 } : {})}
+              >
+                <Text wrap="truncate-end" color={d.by === 'waiting' ? NEEDS_YOU : undefined} bold={d.by === 'waiting'} dimColor={d.by === 'you'}>
                   {d.by === 'waiting' ? '⏸' : '✓'} {d.id} {d.question}
                   {d.by === 'waiting' ? ' · waiting for you' : ` · ${d.chosen} (${d.by === 'claude' ? 'decided by Claude' : 'yours'})`}
                 </Text>
                 {d.by !== 'you' && (
                   <Box flexDirection="column">
                     {d.why !== '' && <Text dimColor wrap="truncate-end">  Recommended: {d.recommended} · {d.why}</Text>}
+                    {d.by === 'waiting' && <Text color={NEEDS_YOU} wrap="truncate-end">  Your input: /decide {d.id} &lt;option&gt;</Text>}
                     <Box flexDirection="row" flexWrap="wrap">
                       {d.options.map(option => (
                         <Button
