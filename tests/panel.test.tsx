@@ -210,11 +210,6 @@ const estimator = (on: Parameters<TestBody>[1], reply: string | null, saved: unk
 
 test('a typed task gets a size, a cost per model and a suggested model', async ($, on) => {
   const commands: string[] = []
-  const copied: string[] = []
-  on('ui.copy', (_, e) => {
-    copied.push(e.text)
-    return { value: { isCopied: true } }
-  })
   engine(on, { now: 1000 }, [])
   estimator(on, SIZED, [], commands)
   await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
@@ -223,11 +218,9 @@ test('a typed task gets a size, a cost per model and a suggested model', async (
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /^Estimate ·/ }))?.text).toBe('Estimate · medium feature')
   expect((await ui.find({ type: 'Text', text: /haiku ~/ }))?.text).toBe('haiku ~$0.03 · sonnet ~$0.53 · opus ~$1.06 · fable ~$1.82')
-  expect((await ui.find({ type: 'Text', text: /Suggested/ }))?.text).toBe('Suggested: opus · multi-file change')
-  await ui.press({ key: 'switch-model' })
+  expect((await ui.find({ type: 'Text', text: /Model switch/ }))?.text).toBe('⇄ Model switch ready')
   await ui.unmount()
-  // A mod cannot switch the model itself: the button copies the command.
-  expect(copied).toEqual(['/model opus'])
+  expect(commands).toEqual([])
 })
 
 test('the actual cost is shown and remembered for later estimates', async ($, on) => {
@@ -242,7 +235,7 @@ test('the actual cost is shown and remembered for later estimates', async ($, on
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   // 10k*2 + 10k*10 + 40k*2.5 + 1M*0.1 = $0.32
-  expect((await ui.find({ type: 'Text', text: /Spent so far/ }))?.text).toBe('Spent so far: $0.32 (estimate ~$0.53 on sonnet)')
+  expect((await ui.find({ type: 'Text', text: /Spent so far/ }))?.text).toBe('Spent so far: $0.32 (estimate ~$1.06 on opus)')
   await ui.unmount()
   expect(JSON.stringify(saved)).toContain('"medium":{"input_tokens":10000')
 })
@@ -293,79 +286,59 @@ test('/decide answers a decision from the prompt, and lists open ones', async ($
   expect((await run('D9 x')).text).toBe('No decision D9.')
 })
 
-test('a typed task on a different suggested model is held until the person starts it', async ($, on) => {
-  sessionModel = 'claude-sonnet-5-5'
-  const prompts: string[] = []
-  engine(on, { now: 1000 }, [], prompts)
-  estimator(on, SIZED, [], [])
-  await start($, 'x')
-  const ran = await $.prompt.submit({ text: 'add a wishlist button', origin: { kind: 'composer' }, wait: false })
-  expect(ran.drop).toContain('Held for a model switch: type /model opus')
-  expect(prompts).toEqual([])
+// Runs one model request of the main loop and returns the model it was sent to.
+const stepModel = async ($: Parameters<TestBody>[0], model: string) => {
+  type StepInput = Parameters<Parameters<TestBody>[0]['turn']['step']>[0]
+  const stream = $.turn.step({ turnId: 't', index: 0, model, messageCount: 1 } as unknown as StepInput)
+  for await (const _chunk of stream) {
+    // Drain the stream; the stand-in below records the model.
+  }
+}
 
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /Held task/ }))?.text).toBe('Held task · needs opus')
-  await ui.unmount()
-})
-
-test('Start task warns while the model differs, then sends the task after the switch', async ($, on) => {
+test('each request of a typed task goes to the suggested model', async ($, on) => {
   sessionModel = 'claude-sonnet-5-5'
-  const prompts: string[] = []
+  const sent: string[] = []
   const toasts: string[] = []
-  engine(on, { now: 1000 }, toasts, prompts)
+  on('turn.step', async function* (_, e) {
+    sent.push(e.model)
+    const usage = { model: e.model, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage }
+  })
+  engine(on, { now: 1000 }, toasts, [])
   estimator(on, SIZED, [], [])
-  await start($, 'x')
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
   await $.prompt.submit({ text: 'add a wishlist button', origin: { kind: 'composer' }, wait: false })
-
-  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: 'held-start' })
-  await ui.unmount()
-  await new Promise<void>(resolve => setTimeout(resolve, 50))
-  expect(prompts).toEqual([])
-  expect(toasts).toEqual(['Still on sonnet. Type /model opus first, or press Start anyway.'])
-
-  sessionModel = 'claude-opus-5-5'
-  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: 'held-start' })
-  await ui.unmount()
-  await new Promise<void>(resolve => setTimeout(resolve, 50))
-  expect(prompts).toEqual(['add a wishlist button'])
-  sessionModel = 'claude-sonnet-5-5'
-})
-
-test('Start anyway sends the held task even while the model differs', async ($, on) => {
-  sessionModel = 'claude-sonnet-5-5'
-  const prompts: string[] = []
-  engine(on, { now: 1000 }, [], prompts)
-  estimator(on, SIZED, [], [])
-  await start($, 'x')
-  await $.prompt.submit({ text: 'rename the class', origin: { kind: 'composer' }, wait: false })
+  await stepModel($, 'claude-sonnet-5-5')
+  await stepModel($, 'claude-sonnet-5-5')
+  expect(sent).toEqual(['opus', 'opus'])
+  // One toast per task, not one per request.
+  expect(toasts).toEqual(['⇄ Switched to opus for this task (session: sonnet)'])
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  await ui.press({ key: 'held-force' })
+  const head = await ui.find({ type: 'Text', text: /Model switched/ })
+  expect(head?.text).toBe('⇄ Model switched')
+  expect(JSON.stringify(head)).toContain('"color":"suggestion"')
+  expect((await ui.find({ type: 'Text', text: /running now/ }))?.text).toContain('sonnet → opus · running now')
   await ui.unmount()
-  await new Promise<void>(resolve => setTimeout(resolve, 50))
-  expect(prompts).toEqual(['rename the class'])
 })
 
-test('/start-task starts the held task once the model matches, and says so before', async ($, on) => {
-  sessionModel = 'claude-sonnet-5-5'
-  const prompts: string[] = []
-  engine(on, { now: 1000 }, [], prompts)
-  estimator(on, SIZED, [], [])
-  await start($, 'x')
-  await $.prompt.submit({ text: 'add a wishlist button', origin: { kind: 'composer' }, wait: false })
-
-  type RunInput = Parameters<Parameters<TestBody>[0]['command']['run']>[0]
-  const typed = () => $.command.run({ command: 'start-task', args: '' } as unknown as RunInput)
-  expect((await typed()).text).toBe('Still on sonnet. Type /model opus first, then /start-task.')
-  await new Promise<void>(resolve => setTimeout(resolve, 50))
-  expect(prompts).toEqual([])
-
+test('a Fable suggestion runs on Opus, and a matching model is left alone', async ($, on) => {
   sessionModel = 'claude-opus-5-5'
-  expect((await typed()).text).toBe('Started the held task on opus.')
-  await new Promise<void>(resolve => setTimeout(resolve, 50))
-  expect(prompts).toEqual(['add a wishlist button'])
-  expect((await typed()).text).toBe('No held task.')
+  const sent: string[] = []
+  on('turn.step', async function* (_, e) {
+    sent.push(e.model)
+    const usage = { model: e.model, input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage }
+  })
+  engine(on, { now: 1000 }, [], [])
+  estimator(on, '{"size":"large","kind":"research","model":"fable","why":"very hard"}', [], [])
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'rewrite the pricing engine', origin: { kind: 'composer' }, wait: false })
+  await stepModel($, 'claude-opus-5-5')
+  expect(sent).toEqual(['claude-opus-5-5'])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Fable suggested/ }))?.text).toBe('Fable suggested; auto stays on opus. Type /model fable to use it.')
+  await ui.unmount()
   sessionModel = 'claude-sonnet-5-5'
 })

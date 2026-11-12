@@ -9,7 +9,7 @@ A Claude Code side panel that shows what Claude is doing while it works, so you 
 - **Progress** — Claude's to-do list with a done count, when it keeps one.
 - **Files changed** — every file Claude added (A), edited (M) or removed (D) this session, with lines added and removed.
 - **Recent steps** — the last steps of the current task, marked done, running or failed, with how long each took.
-- **Estimate** — when you send a task, the smallest model (Haiku) sizes it in the background (tiny, small, medium or large) and suggests the cheapest model that fits. The panel shows a cost per model (`haiku ~$0.03 · sonnet ~$0.53 · opus ~$1.06 · fable ~$1.82`), a **Switch to …** button (runs `/model`), and the actual cost when the task ends. Estimates start rough and learn from your real tasks. Costs use API prices; on a subscription plan they show usage weight, not a bill.
+- **Estimate and automatic model** — when you send a task, the smallest model (Haiku) sizes it first (tiny, small, medium or large) and picks the cheapest model that fits. The task's requests then go to that model by themselves; your `/model` default is not changed. The panel shows a cost per model (`haiku ~$0.03 · sonnet ~$0.53 · opus ~$1.06 · fable ~$1.82`), `Auto: running on sonnet (session: opus)`, and the actual cost when the task ends. It never moves up to Fable on its own: a Fable suggestion runs on Opus. Estimates start rough and learn from your real tasks. Costs use API prices; on a subscription plan they show usage weight, not a bill.
 - **Decisions** — Claude doesn't stop to ask. It calls a `decide` tool this mod adds:
   - *small* choices (naming, wording, styling): Claude picks its recommendation and keeps going;
   - *costly* choices (architecture, data format, push, delete): Claude parks that part, does everything else, and waits.
@@ -59,7 +59,7 @@ Start a new session. The panel opens by itself in a wide terminal; run `/progres
 - A sub-agent's file changes are counted; its steps are not listed.
 - After you approve a permission prompt, "Needs you" stays until that step finishes; Claude Code has no event for the moment you answer.
 
-Estimate notes: switching models restarts the prompt cache, so a switch mid-task can cost more than it saves. Only main-loop turns are counted; sub-agents are not.
+Estimate notes: the sizing call runs before your task starts, so there is a short pause. An automatic switch restarts the prompt cache for that task. Only main-loop turns are counted; sub-agents keep the session's model and are not counted.
 
 ## Development
 

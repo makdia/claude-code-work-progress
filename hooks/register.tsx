@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, RenderSurface, Timer } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { Activity, ChangeKind, Decision, DecisionCost, Estimate, FileChange, HeldTask, ModelTier, Step, TaskSize, Todo } from '../types'
+import type { Activity, ChangeKind, Decision, DecisionCost, Estimate, FileChange, ModelTier, Step, TaskSize, Todo } from '../types'
 
 const PANE = 'work-progress'
 const TITLE = 'Work progress'
@@ -16,8 +16,7 @@ const decisions = atom({ plugin: 'work-progress', key: 'decisions' } as const, [
 // Answers from the person not yet read by Claude.
 const notes = atom({ plugin: 'work-progress', key: 'notes' } as const, [] as string[], { shape: 'notes-1' })
 
-const estimate = atom({ plugin: 'work-progress', key: 'estimate' } as const, null as Estimate | null, { shape: 'estimate-1' })
-const held = atom({ plugin: 'work-progress', key: 'held' } as const, null as HeldTask | null, { shape: 'held-1' })
+const estimate = atom({ plugin: 'work-progress', key: 'estimate' } as const, null as Estimate | null, { shape: 'estimate-3' })
 
 // API prices in dollars per million tokens (Claude API reference, 2026-11-03).
 // Cache write is 1.25x input; Haiku's cache read is assumed at 0.1x input.
@@ -70,6 +69,8 @@ const parseEstimate = (text: string) => {
 
 // Claude Code's own color for asking the person; red stays for failures.
 const NEEDS_YOU = 'permission'
+// A model switch has its own color, apart from questions and failures.
+const SWITCH_COLOR = 'suggestion'
 
 const DECIDE = 'decide'
 const DECIDE_TOOL = /^mcp__work-progress__decide$/
@@ -209,7 +210,10 @@ const runEstimate = async ($: Dollar, task: string) => {
   }
   const usage = expected(await readCalibration($), parsed.size)
   const costs = { haiku: costOf(usage, 'haiku'), sonnet: costOf(usage, 'sonnet'), opus: costOf(usage, 'opus'), fable: costOf(usage, 'fable') }
-  await update($, estimate, e => (e && e.task === task ? { ...e, ...parsed, state: 'ready' as const, current, costs } : e))
+  // Never moved up to Fable unasked: a Fable suggestion runs on Opus.
+  const pick: ModelTier = parsed.suggested === 'fable' ? 'opus' : parsed.suggested
+  const auto = pick === current ? ('' as const) : pick
+  await update($, estimate, e => (e && e.task === task ? { ...e, ...parsed, state: 'ready' as const, current, costs, auto } : e))
 }
 
 const learn = async ($: Dollar, size: TaskSize, used: Usage) => {
@@ -219,34 +223,6 @@ const learn = async ($: Dollar, size: TaskSize, used: Usage) => {
   const avg = (key: keyof Usage) => seen[key] + (used[key] - seen[key]) / n
   calibration[size] = { input_tokens: avg('input_tokens'), output_tokens: avg('output_tokens'), cache_creation_input_tokens: avg('cache_creation_input_tokens'), cache_read_input_tokens: avg('cache_read_input_tokens'), count: n }
   await $.store.set(CALIBRATION_KEY, calibration)
-}
-
-// A mod cannot change the session's model, so copy the command for the person to paste.
-const copyModelCommand = async ($: Dollar, tier: ModelTier, surface: RenderSurface) => {
-  const command = `/model ${tier}`
-  const copied = await $.ui.copy({ text: command, surface }).catch(() => ({ isCopied: false as const, reason: 'no-surface' as const }))
-  $.ui.toast(copied.isCopied ? `Copied ${command}. Paste it at the prompt and press Enter.` : `Type ${command} at the prompt.`)
-}
-
-// Sends the held task to Claude as the person's own words, once the command or button returns.
-const release = async ($: Dollar, task: HeldTask, now: ModelTier | '') => {
-  await update($, held, () => null)
-  await update($, estimate, e => (e ? { ...e, current: now || e.current } : e))
-  $.clock.after(0, () => {
-    void $.prompt.submit({ text: task.text, asUser: true }).catch(() => $.ui.toast('Could not start the held task'))
-  })
-}
-
-// Button path: warns while the model is still not the suggested one, unless forced.
-const startHeld = async ($: Dollar, force: boolean) => {
-  const task = await read($, held)
-  if (!task) return
-  const now = tierOf(await $.session.model().catch(() => ''))
-  if (!force && now !== task.suggested) {
-    $.ui.toast(`Still on ${now || 'the current model'}. Type /model ${task.suggested} first, or press Start anyway.`)
-    return
-  }
-  await release($, task, now)
 }
 
 // The person picks an option in the panel.
@@ -261,29 +237,37 @@ const choose = async ($: Dollar, id: string, choice: string) => {
 }
 
 export const register: Register = on => {
-  // A typed task whose suggested model differs from the current one waits for the person to start it.
+  // A typed task is sized before it starts, so its first request can go to the suggested model.
   on('prompt.submit', async ($, e, next) => {
     const isOurs = e.origin?.kind === 'plugin' && e.origin.name === 'work-progress'
     const isTyped = e.command === undefined && e.origin?.kind !== 'plugin' && !e.isMeta
     if (isOurs || !isTyped || e.text.trim().length === 0) return next(e)
 
     const empty = { haiku: 0, sonnet: 0, opus: 0, fable: 0 }
-    await update($, estimate, () => ({ task: e.text, state: 'thinking' as const, size: 'small' as const, kind: '', suggested: 'sonnet' as const, why: '', current: '' as const, costs: empty, actual: 0 }))
+    await update($, estimate, () => ({ task: e.text, state: 'thinking' as const, size: 'small' as const, kind: '', suggested: 'sonnet' as const, why: '', current: '' as const, auto: '' as const, ran: '' as const, costs: empty, actual: 0 }))
     await runEstimate($, e.text).catch(() =>
       update($, estimate, x => (x && x.task === e.text ? { ...x, state: 'failed' as const } : x)),
     )
-    const est = await read($, estimate)
-    if (est && est.state === 'ready' && est.current !== '' && est.suggested !== est.current) {
-      await update($, held, () => ({ text: e.text, suggested: est.suggested, current: est.current }))
-      return { drop: `Held for a model switch: type /model ${est.suggested}, then press Start task in Work progress.` }
-    }
     return next(e)
+  })
+
+  // Each request of the task goes to the suggested model; the session's /model stays as it is.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined) return yield* next(e)
+    const est = await read($, estimate)
+    const pick = est && est.state === 'ready' ? est.auto : ''
+    if (!est || !pick || tierOf(e.model) === pick) return yield* next(e)
+    // Say so once per task, in the panel and as a short toast.
+    if (est.ran !== pick) {
+      await update($, estimate, x => (x && x.task === est.task ? { ...x, ran: pick } : x))
+      if (est.ran === '') $.ui.toast(`⇄ Switched to ${pick} for this task (session: ${est.current || 'unchanged'})`, { timeoutMs: 6000 })
+    }
+    return yield* next({ ...e, model: pick })
   })
 
   on('session.start', async ($, e, next) => {
     cwd = await $.session.cwd()
     await $.command.register({ name: 'progress', description: 'Open the work progress side panel' })
-    await $.command.register({ name: 'start-task', description: 'Start the task held for a model switch' })
     await $.command.register({ name: 'decide', description: 'Answer a decision from the Work progress panel: /decide D2 theme.json', argumentHint: '<id> <option or your own answer>' })
     await $.tool.register({
       name: DECIDE,
@@ -306,18 +290,6 @@ export const register: Register = on => {
   })
 
   // Answers a decision from the prompt, where the panel's buttons need focus first.
-  // Typed start for a held task, after the person has run /model.
-  on('command.run', { command: 'start-task' }, async $ => {
-    const task = await read($, held)
-    if (!task) return { text: 'No held task.' }
-    const now = tierOf(await $.session.model().catch(() => ''))
-    if (now !== task.suggested) {
-      return { text: `Still on ${now || 'the current model'}. Type /model ${task.suggested} first, then /start-task.` }
-    }
-    await release($, task, now)
-    return { text: `Started the held task on ${now}.` }
-  })
-
   on('command.run', { command: 'decide' }, async ($, e) => {
     const list = await read($, decisions)
     const match = (e.args ?? '').trim().match(/^(D\d+)\s+(.+)$/i)
@@ -480,8 +452,8 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
-    const [act, stepList, fileList, todoList, decisionList, est, heldTask, now] = await Promise.all([
-      read($, activity), read($, steps), read($, changes), read($, todos), read($, decisions), read($, estimate), read($, held), $.clock.now(),
+    const [act, stepList, fileList, todoList, decisionList, est, now] = await Promise.all([
+      read($, activity), read($, steps), read($, changes), read($, todos), read($, decisions), read($, estimate), $.clock.now(),
     ])
     const waiting = decisionList.filter(d => d.by === 'waiting')
     // Open ones first, then the latest decided ones.
@@ -514,21 +486,6 @@ export const register: Register = on => {
           Now: {act.isWorking ? (running ? running.label : 'Thinking…') : 'Waiting for you'}
         </Text>
 
-        {heldTask && (
-          <Box flexDirection="column" borderStyle="round" borderColor={NEEDS_YOU} paddingX={1} marginTop={1}>
-            <Text bold color={NEEDS_YOU}>Held task · needs {heldTask.suggested}</Text>
-            <Text wrap="truncate-end">{clip(heldTask.text, width - 6)}</Text>
-            <Text dimColor wrap="truncate-end">Type /model {heldTask.suggested}, then /start-task or press Start task.</Text>
-            <Box flexDirection="row" flexWrap="wrap">
-              <Button key="held-copy" onPress={press => void copyModelCommand($, heldTask.suggested, press.surface)}>
-                Copy /model {heldTask.suggested}
-              </Button>
-              <Button key="held-start" variant="primary" onPress={() => void startHeld($, false)}>Start task</Button>
-              <Button key="held-force" onPress={() => void startHeld($, true)}>Start anyway</Button>
-            </Box>
-          </Box>
-        )}
-
         {est && (
           <Box flexDirection="column" marginTop={1}>
             {est.state === 'thinking' && <Text dimColor>Estimate: sizing the task…</Text>}
@@ -539,24 +496,28 @@ export const register: Register = on => {
                 <Text wrap="truncate-end">
                   {TIERS.map(t => `${t} ~${dollars(est.costs[t])}`).join(' · ')}
                 </Text>
-                <Text wrap="truncate-end" color={est.current !== '' && est.current !== est.suggested ? 'cyan' : 'green'}>
-                  {est.current === est.suggested ? `✓ ${est.current} fits this task` : `Suggested: ${est.suggested}`}
-                  {est.why ? ` · ${est.why}` : ''}
-                </Text>
-                {est.current !== '' && est.current !== est.suggested && (
-                  <Box flexDirection="row">
-                    <Button key="switch-model" variant="primary" onPress={press => void copyModelCommand($, est.suggested, press.surface)}>
-                      Copy /model {est.suggested}
-                    </Button>
-                    <Text dimColor> now: {est.current} · paste it at the prompt; a switch restarts the prompt cache</Text>
+                {est.auto ? (
+                  <Box flexDirection="column" borderStyle="round" borderColor={SWITCH_COLOR} paddingX={1}>
+                    <Text bold color={SWITCH_COLOR}>{est.ran ? '⇄ Model switched' : '⇄ Model switch ready'}</Text>
+                    <Text wrap="truncate-end">
+                      {est.current || 'session model'} → <Text bold color={SWITCH_COLOR}>{est.auto}</Text>
+                      {est.ran ? ' · running now' : ' · starts with the first request'}
+                    </Text>
+                    <Text dimColor wrap="truncate-end">{est.why || est.kind} · this task only</Text>
+                    <Text dimColor wrap="truncate-end">A switch restarts the prompt cache for this task.</Text>
                   </Box>
+                ) : (
+                  <Text wrap="truncate-end" color="green">
+                    ✓ {est.current || est.suggested} fits this task{est.why ? ` · ${est.why}` : ''}
+                  </Text>
                 )}
+                {est.suggested === 'fable' && <Text dimColor>Fable suggested; auto stays on opus. Type /model fable to use it.</Text>}
               </Box>
             )}
             {est.actual > 0 && (
               <Text wrap="truncate-end">
                 Spent so far: {dollars(est.actual)}
-                {est.state === 'ready' && est.current !== '' ? ` (estimate ~${dollars(est.costs[est.current])} on ${est.current})` : ''}
+                {est.state === 'ready' && (est.auto || est.current) ? ` (estimate ~${dollars(est.costs[est.auto || est.current || 'sonnet'])} on ${est.auto || est.current})` : ''}
               </Text>
             )}
             <Text dimColor>At API prices; on a plan this is usage, not a bill.</Text>

@@ -26,14 +26,15 @@ export type Estimate = {
   why: string
   // The session's model when the task started, as a tier ('' if unknown).
   current: ModelTier | ''
+  // The model this task's requests are sent to instead ('' keeps the session's).
+  auto: ModelTier | ''
+  // The model the task's requests really went to ('' until the first one is sent).
+  ran: ModelTier | ''
   // Estimated dollars per tier at API prices.
   costs: Record<ModelTier, number>
   // Dollars actually spent on this task so far (main loop turns).
   actual: number
 }
-
-// A typed task waiting for the person to set the suggested model.
-export type HeldTask = { text: string; suggested: ModelTier; current: ModelTier }
 
 export type Activity = {
   isWorking: boolean
@@ -58,7 +59,6 @@ declare module 'claude-code' {
       decisions: Shaped<Decision[]>
       notes: Shaped<string[]>
       estimate: Shaped<Estimate | null>
-      held: Shaped<HeldTask | null>
     }
   }
 }
