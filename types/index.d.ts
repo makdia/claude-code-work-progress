@@ -32,6 +32,9 @@ export type Estimate = {
   actual: number
 }
 
+// A typed task waiting for the person to set the suggested model.
+export type HeldTask = { text: string; suggested: ModelTier; current: ModelTier }
+
 export type Activity = {
   isWorking: boolean
   task: string
@@ -55,6 +58,7 @@ declare module 'claude-code' {
       decisions: Shaped<Decision[]>
       notes: Shaped<string[]>
       estimate: Shaped<Estimate | null>
+      held: Shaped<HeldTask | null>
     }
   }
 }

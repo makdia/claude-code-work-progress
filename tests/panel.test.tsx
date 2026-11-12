@@ -192,8 +192,10 @@ test('a decide call with a recommendation outside its options is refused', async
 
 const SIZED = '{"size":"medium","kind":"feature","model":"opus","why":"multi-file change"}'
 // reply null: the model call is refused.
+// The session's model, which a test can change to simulate /model.
+let sessionModel = 'claude-sonnet-5-5'
 const estimator = (on: Parameters<TestBody>[1], reply: string | null, saved: unknown[], commands: string[]) => {
-  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.model', () => ({ value: sessionModel }))
   on('model.complete', () => reply === null ? { deny: 'blocked' } : ({ value: { isAnswered: true, text: reply, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }))
   on('store.get', () => ({ value: undefined }))
   on('store.set', (_, e) => {
@@ -289,4 +291,81 @@ test('/decide answers a decision from the prompt, and lists open ones', async ($
   await new Promise<void>(resolve => setTimeout(resolve, 50))
   expect(prompts).toEqual(['Decision D1 changed by the person: "Hover shadow?" → strong (you had used soft). Revise the work that used soft.'])
   expect((await run('D9 x')).text).toBe('No decision D9.')
+})
+
+test('a typed task on a different suggested model is held until the person starts it', async ($, on) => {
+  sessionModel = 'claude-sonnet-5-5'
+  const prompts: string[] = []
+  engine(on, { now: 1000 }, [], prompts)
+  estimator(on, SIZED, [], [])
+  await start($, 'x')
+  const ran = await $.prompt.submit({ text: 'add a wishlist button', origin: { kind: 'composer' }, wait: false })
+  expect(ran.drop).toContain('Held for a model switch: type /model opus')
+  expect(prompts).toEqual([])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /Held task/ }))?.text).toBe('Held task · needs opus')
+  await ui.unmount()
+})
+
+test('Start task warns while the model differs, then sends the task after the switch', async ($, on) => {
+  sessionModel = 'claude-sonnet-5-5'
+  const prompts: string[] = []
+  const toasts: string[] = []
+  engine(on, { now: 1000 }, toasts, prompts)
+  estimator(on, SIZED, [], [])
+  await start($, 'x')
+  await $.prompt.submit({ text: 'add a wishlist button', origin: { kind: 'composer' }, wait: false })
+
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'held-start' })
+  await ui.unmount()
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+  expect(prompts).toEqual([])
+  expect(toasts).toEqual(['Still on sonnet. Type /model opus first, or press Start anyway.'])
+
+  sessionModel = 'claude-opus-5-5'
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'held-start' })
+  await ui.unmount()
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+  expect(prompts).toEqual(['add a wishlist button'])
+  sessionModel = 'claude-sonnet-5-5'
+})
+
+test('Start anyway sends the held task even while the model differs', async ($, on) => {
+  sessionModel = 'claude-sonnet-5-5'
+  const prompts: string[] = []
+  engine(on, { now: 1000 }, [], prompts)
+  estimator(on, SIZED, [], [])
+  await start($, 'x')
+  await $.prompt.submit({ text: 'rename the class', origin: { kind: 'composer' }, wait: false })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'held-force' })
+  await ui.unmount()
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+  expect(prompts).toEqual(['rename the class'])
+})
+
+test('/start-task starts the held task once the model matches, and says so before', async ($, on) => {
+  sessionModel = 'claude-sonnet-5-5'
+  const prompts: string[] = []
+  engine(on, { now: 1000 }, [], prompts)
+  estimator(on, SIZED, [], [])
+  await start($, 'x')
+  await $.prompt.submit({ text: 'add a wishlist button', origin: { kind: 'composer' }, wait: false })
+
+  type RunInput = Parameters<Parameters<TestBody>[0]['command']['run']>[0]
+  const typed = () => $.command.run({ command: 'start-task', args: '' } as unknown as RunInput)
+  expect((await typed()).text).toBe('Still on sonnet. Type /model opus first, then /start-task.')
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+  expect(prompts).toEqual([])
+
+  sessionModel = 'claude-opus-5-5'
+  expect((await typed()).text).toBe('Started the held task on opus.')
+  await new Promise<void>(resolve => setTimeout(resolve, 50))
+  expect(prompts).toEqual(['add a wishlist button'])
+  expect((await typed()).text).toBe('No held task.')
+  sessionModel = 'claude-sonnet-5-5'
 })

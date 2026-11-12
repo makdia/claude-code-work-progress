@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface, Timer } from 'claude-code'
 
-import type { Activity, ChangeKind, Decision, DecisionCost, Estimate, FileChange, ModelTier, Step, TaskSize, Todo } from '../types'
+import type { Activity, ChangeKind, Decision, DecisionCost, Estimate, FileChange, HeldTask, ModelTier, Step, TaskSize, Todo } from '../types'
 
 const PANE = 'work-progress'
 const TITLE = 'Work progress'
@@ -17,6 +17,7 @@ const decisions = atom({ plugin: 'work-progress', key: 'decisions' } as const, [
 const notes = atom({ plugin: 'work-progress', key: 'notes' } as const, [] as string[], { shape: 'notes-1' })
 
 const estimate = atom({ plugin: 'work-progress', key: 'estimate' } as const, null as Estimate | null, { shape: 'estimate-1' })
+const held = atom({ plugin: 'work-progress', key: 'held' } as const, null as HeldTask | null, { shape: 'held-1' })
 
 // API prices in dollars per million tokens (Claude API reference, 2026-11-03).
 // Cache write is 1.25x input; Haiku's cache read is assumed at 0.1x input.
@@ -227,6 +228,27 @@ const copyModelCommand = async ($: Dollar, tier: ModelTier, surface: RenderSurfa
   $.ui.toast(copied.isCopied ? `Copied ${command}. Paste it at the prompt and press Enter.` : `Type ${command} at the prompt.`)
 }
 
+// Sends the held task to Claude as the person's own words, once the command or button returns.
+const release = async ($: Dollar, task: HeldTask, now: ModelTier | '') => {
+  await update($, held, () => null)
+  await update($, estimate, e => (e ? { ...e, current: now || e.current } : e))
+  $.clock.after(0, () => {
+    void $.prompt.submit({ text: task.text, asUser: true }).catch(() => $.ui.toast('Could not start the held task'))
+  })
+}
+
+// Button path: warns while the model is still not the suggested one, unless forced.
+const startHeld = async ($: Dollar, force: boolean) => {
+  const task = await read($, held)
+  if (!task) return
+  const now = tierOf(await $.session.model().catch(() => ''))
+  if (!force && now !== task.suggested) {
+    $.ui.toast(`Still on ${now || 'the current model'}. Type /model ${task.suggested} first, or press Start anyway.`)
+    return
+  }
+  await release($, task, now)
+}
+
 // The person picks an option in the panel.
 const choose = async ($: Dollar, id: string, choice: string) => {
   const list = await read($, decisions)
@@ -239,26 +261,29 @@ const choose = async ($: Dollar, id: string, choice: string) => {
 }
 
 export const register: Register = on => {
-  // A typed task gets a quick size and cost estimate from the smallest model.
+  // A typed task whose suggested model differs from the current one waits for the person to start it.
   on('prompt.submit', async ($, e, next) => {
-    const ran = await next(e)
+    const isOurs = e.origin?.kind === 'plugin' && e.origin.name === 'work-progress'
     const isTyped = e.command === undefined && e.origin?.kind !== 'plugin' && !e.isMeta
-    if (isTyped && e.text.trim().length > 0) {
-      const empty = { haiku: 0, sonnet: 0, opus: 0, fable: 0 }
-      await update($, estimate, () => ({ task: e.text, state: 'thinking' as const, size: 'small' as const, kind: '', suggested: 'sonnet' as const, why: '', current: '' as const, costs: empty, actual: 0 }))
-      // Off the prompt's path: the task starts while the estimate runs.
-      $.clock.after(0, () => {
-        void runEstimate($, e.text).catch(() =>
-          update($, estimate, x => (x && x.task === e.text ? { ...x, state: 'failed' as const } : x)),
-        )
-      })
+    if (isOurs || !isTyped || e.text.trim().length === 0) return next(e)
+
+    const empty = { haiku: 0, sonnet: 0, opus: 0, fable: 0 }
+    await update($, estimate, () => ({ task: e.text, state: 'thinking' as const, size: 'small' as const, kind: '', suggested: 'sonnet' as const, why: '', current: '' as const, costs: empty, actual: 0 }))
+    await runEstimate($, e.text).catch(() =>
+      update($, estimate, x => (x && x.task === e.text ? { ...x, state: 'failed' as const } : x)),
+    )
+    const est = await read($, estimate)
+    if (est && est.state === 'ready' && est.current !== '' && est.suggested !== est.current) {
+      await update($, held, () => ({ text: e.text, suggested: est.suggested, current: est.current }))
+      return { drop: `Held for a model switch: type /model ${est.suggested}, then press Start task in Work progress.` }
     }
-    return ran
+    return next(e)
   })
 
   on('session.start', async ($, e, next) => {
     cwd = await $.session.cwd()
     await $.command.register({ name: 'progress', description: 'Open the work progress side panel' })
+    await $.command.register({ name: 'start-task', description: 'Start the task held for a model switch' })
     await $.command.register({ name: 'decide', description: 'Answer a decision from the Work progress panel: /decide D2 theme.json', argumentHint: '<id> <option or your own answer>' })
     await $.tool.register({
       name: DECIDE,
@@ -281,6 +306,18 @@ export const register: Register = on => {
   })
 
   // Answers a decision from the prompt, where the panel's buttons need focus first.
+  // Typed start for a held task, after the person has run /model.
+  on('command.run', { command: 'start-task' }, async $ => {
+    const task = await read($, held)
+    if (!task) return { text: 'No held task.' }
+    const now = tierOf(await $.session.model().catch(() => ''))
+    if (now !== task.suggested) {
+      return { text: `Still on ${now || 'the current model'}. Type /model ${task.suggested} first, then /start-task.` }
+    }
+    await release($, task, now)
+    return { text: `Started the held task on ${now}.` }
+  })
+
   on('command.run', { command: 'decide' }, async ($, e) => {
     const list = await read($, decisions)
     const match = (e.args ?? '').trim().match(/^(D\d+)\s+(.+)$/i)
@@ -443,8 +480,8 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
-    const [act, stepList, fileList, todoList, decisionList, est, now] = await Promise.all([
-      read($, activity), read($, steps), read($, changes), read($, todos), read($, decisions), read($, estimate), $.clock.now(),
+    const [act, stepList, fileList, todoList, decisionList, est, heldTask, now] = await Promise.all([
+      read($, activity), read($, steps), read($, changes), read($, todos), read($, decisions), read($, estimate), read($, held), $.clock.now(),
     ])
     const waiting = decisionList.filter(d => d.by === 'waiting')
     // Open ones first, then the latest decided ones.
@@ -476,6 +513,21 @@ export const register: Register = on => {
         <Text wrap="truncate-end">
           Now: {act.isWorking ? (running ? running.label : 'Thinking…') : 'Waiting for you'}
         </Text>
+
+        {heldTask && (
+          <Box flexDirection="column" borderStyle="round" borderColor={NEEDS_YOU} paddingX={1} marginTop={1}>
+            <Text bold color={NEEDS_YOU}>Held task · needs {heldTask.suggested}</Text>
+            <Text wrap="truncate-end">{clip(heldTask.text, width - 6)}</Text>
+            <Text dimColor wrap="truncate-end">Type /model {heldTask.suggested}, then /start-task or press Start task.</Text>
+            <Box flexDirection="row" flexWrap="wrap">
+              <Button key="held-copy" onPress={press => void copyModelCommand($, heldTask.suggested, press.surface)}>
+                Copy /model {heldTask.suggested}
+              </Button>
+              <Button key="held-start" variant="primary" onPress={() => void startHeld($, false)}>Start task</Button>
+              <Button key="held-force" onPress={() => void startHeld($, true)}>Start anyway</Button>
+            </Box>
+          </Box>
+        )}
 
         {est && (
           <Box flexDirection="column" marginTop={1}>
