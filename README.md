@@ -52,6 +52,12 @@ Or clone the repository to `~/.claude/mods/work-progress` and load the folder in
 
 Start a new session. The panel opens by itself in a wide terminal; run `/progress` to open it any time. Run `/progress off` to stop it opening in new sessions, and `/progress on` to bring it back; the mod keeps tracking either way.
 
+## Updating
+
+- **Marketplace install:** open `/plugin` in Claude Code and update work-progress from there. The version is in `.claude-plugin/plugin.json`; after an update it should match the latest release.
+- **Cloned folder:** run `git pull` in `~/.claude/mods/work-progress`. Nothing updates it on its own.
+- **Release file:** the `work-progress.plugin` on each GitHub release is a manual download. Installing it does not update a copy that is already installed.
+
 ## Limits
 
 - Only changes made through Claude's tools are tracked; your own edits and files changed by builds are not.
