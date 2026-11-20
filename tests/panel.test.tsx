@@ -12,14 +12,17 @@ const PANE = {
 } as const
 
 // Stands in for the engine: a clock the test moves, and tool results.
-const engine = (on: Parameters<TestBody>[1], clock: { now: number }, toasts: string[], prompts: string[] = []) => {
+const engine = (on: Parameters<TestBody>[1], clock: { now: number }, toasts: string[], prompts: string[] = [], opened: string[] = []) => {
   on('prompt.submit', (_, e) => {
     prompts.push(e.text)
     return { text: e.text }
   })
   on('tool.register', () => ({ value: { tool: 'mcp__work-progress__decide' } }))
   on('command.register', () => ({ value: { command: 'progress' } }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } }
+  })
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('clock.now', () => ({ value: clock.now }))
@@ -341,4 +344,32 @@ test('a Fable suggestion runs on Opus, and a matching model is left alone', asyn
   expect((await ui.find({ type: 'Text', text: /Fable suggested/ }))?.text).toBe('Fable suggested; auto stays on opus. Type /model fable to use it.')
   await ui.unmount()
   sessionModel = 'claude-sonnet-5-5'
+})
+
+test('/progress off keeps the panel closed in new sessions, /progress on brings it back', async ($, on) => {
+  const opened: string[] = []
+  const closed: string[] = []
+  const store: Record<string, unknown> = { 'show-panel': false }
+  engine(on, { now: 1000 }, [], [], opened)
+  on('ui.close', (_, e) => {
+    closed.push(e.id)
+    return { value: undefined }
+  })
+  on('store.get', (_, e) => ({ value: store[e.key] }))
+  on('store.set', (_, e) => {
+    store[e.key] = e.value
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  expect(opened).toEqual([])
+
+  type RunInput = Parameters<Parameters<TestBody>[0]['command']['run']>[0]
+  const run = (args: string) => $.command.run({ command: 'progress', args } as unknown as RunInput)
+  await run('on')
+  expect(store['show-panel']).toBe(true)
+  expect(opened).toEqual(['work-progress'])
+
+  await run('off')
+  expect(store['show-panel']).toBe(false)
+  expect(closed).toEqual(['work-progress'])
 })

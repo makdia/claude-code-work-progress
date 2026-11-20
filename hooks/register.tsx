@@ -37,6 +37,8 @@ const PRIOR: Record<TaskSize, Usage> = {
 }
 const SIZES = Object.keys(PRIOR) as TaskSize[]
 const CALIBRATION_KEY = 'calibration-v1'
+// false once the person runs /progress off; new sessions then start without the panel.
+const SHOW_PANEL_KEY = 'show-panel'
 type Calibration = Partial<Record<TaskSize, Usage & { count: number }>>
 
 const tierOf = (model: string): ModelTier | '' => TIERS.find(t => model.toLowerCase().includes(t)) ?? ''
@@ -267,7 +269,7 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     cwd = await $.session.cwd()
-    await $.command.register({ name: 'progress', description: 'Open the work progress side panel' })
+    await $.command.register({ name: 'progress', description: 'Open the work progress side panel; on/off sets whether it opens in every session', argumentHint: '[on|off]' })
     await $.command.register({ name: 'decide', description: 'Answer a decision from the Work progress panel: /decide D2 theme.json', argumentHint: '<id> <option or your own answer>' })
     await $.tool.register({
       name: DECIDE,
@@ -285,7 +287,8 @@ export const register: Register = on => {
         required: ['question', 'options', 'recommended', 'why', 'cost'],
       },
     })
-    void $.ui.open({ id: PANE, title: TITLE })
+    const showPanel = await $.store.get(SHOW_PANEL_KEY).catch(() => undefined)
+    if (showPanel !== false) void $.ui.open({ id: PANE, title: TITLE })
     return next(e)
   })
 
@@ -308,9 +311,16 @@ export const register: Register = on => {
     return { text: `${id} → ${option}.` }
   })
 
-  on('command.run', { command: 'progress' }, async $ => {
+  on('command.run', { command: 'progress' }, async ($, e) => {
+    const choice = (e.args ?? '').trim().toLowerCase()
+    if (choice === 'off') {
+      await $.store.set(SHOW_PANEL_KEY, false)
+      await $.ui.close({ id: PANE })
+      return { text: 'Work progress panel off. Run /progress on to show it again.' }
+    }
+    if (choice === 'on') await $.store.set(SHOW_PANEL_KEY, true)
     await $.ui.open({ id: PANE, title: TITLE })
-    return { text: 'Work progress panel opened.' }
+    return { text: choice === 'on' ? 'Work progress panel on: it opens in every session.' : 'Work progress panel opened.' }
   })
 
   on('turn.start', async ($, e, next) => {

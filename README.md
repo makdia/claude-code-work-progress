@@ -50,7 +50,7 @@ Or clone the repository to `~/.claude/mods/work-progress` and load the folder in
 "env": { "CLAUDE_CODE_PLUGIN_DIRS": "~/.claude/mods/work-progress" }
 ```
 
-Start a new session. The panel opens by itself in a wide terminal; run `/progress` to open it any time.
+Start a new session. The panel opens by itself in a wide terminal; run `/progress` to open it any time. Run `/progress off` to stop it opening in new sessions, and `/progress on` to bring it back; the mod keeps tracking either way.
 
 ## Limits
 
