@@ -54,7 +54,14 @@ Start a new session. The panel opens by itself in a wide terminal; run `/progres
 
 ## Updating
 
-- **Marketplace install:** open `/plugin` in Claude Code and update work-progress from there. The version is in `.claude-plugin/plugin.json`; after an update it should match the latest release.
+- **Marketplace install:** run these in a terminal, then restart Claude Code:
+
+  ```
+  claude plugin marketplace update claude-code-work-progress
+  claude plugin update work-progress@claude-code-work-progress
+  ```
+
+  `claude plugin list` shows the installed version; it should match the latest release.
 - **Cloned folder:** run `git pull` in `~/.claude/mods/work-progress`. Nothing updates it on its own.
 - **Release file:** the `work-progress.plugin` on each GitHub release is a manual download. Installing it does not update a copy that is already installed.
 
